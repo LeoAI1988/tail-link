@@ -1,0 +1,16 @@
+[Unit]
+Description=Tail.Link FastAPI Service
+After=network.target
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/opt/tail-link/backend
+# 用项目自带 venv 的 python 启动 uvicorn
+ExecStart=/opt/tail-link/backend/venv/bin/uvicorn main:app --host 127.0.0.1 --port 8000 --workers 2
+Restart=always
+RestartSec=3
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=multi-user.target
