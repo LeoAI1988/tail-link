@@ -667,8 +667,25 @@
   var s_agentName = localStorage.getItem(K2) || "";
   var s_consentId = localStorage.getItem(K3) || "";
   var s_agentBio = null;  // v0.3.5: 后端 verify 返回的 agent_bio (city/friend_description)
+  var s_matches = [];
   var currentSection = null;
   var currentNeed = null;
+
+  function escapeHtml(value) {
+    return String(value == null ? "" : value)
+      .replace(/&/g, "&amp;")
+      .replace(/</g, "&lt;")
+      .replace(/>/g, "&gt;")
+      .replace(/"/g, "&quot;")
+      .replace(/'/g, "&#39;");
+  }
+
+  function consentIdFromResponse(d) {
+    if (d.consent_id) return d.consent_id;
+    var match = String(d.next_step || "").match(/consent_[A-Za-z0-9_-]+/);
+    if (!match) throw new Error("服务端未返回授权链接");
+    return match[0];
+  }
 
   // ===== 平台记忆位置提示 =====
   var PLATFORM_HINTS = {
@@ -689,10 +706,17 @@
   // ==========================================
   var v3_token = null;
   var v3_verify_code = null;
+  var v3_platform = null;
+
+  function currentV3Platform() {
+    var platformEl = document.getElementById("agent-platform");
+    return v3_platform || (platformEl && platformEl.value) || "generic";
+  }
 
   async function startV3() {
     // v0.3.3 正确流程: 启动 → 出现 curl 文本框 → 主人复制给智能体 → 智能体跑 → 主人粘回 verify_code
     var platform = document.getElementById("agent-platform").value;
+    v3_platform = platform;
     try {
       var r1 = await fetch("/api/handshake/start", {
         method: "POST",
@@ -709,7 +733,7 @@
   }
 
   function showHandshakeStep1(d) {
-    var platform = document.getElementById("agent-platform").value;
+    var platform = currentV3Platform();
     var hint = "";
     if (platform === "claude_code") hint = "Claude Code 会在粘贴后自动跑（curl 推送）";
     else if (platform === "hermes") hint = "米娅会自动跑（你看到的就是米娅）";
@@ -722,9 +746,9 @@
       "<p class='meta' style='color:var(--text-faint);margin:8px 0 4px'>" + hint + "</p>" +
       "<label>1. 复制下面这行命令</label>" +
       "<textarea readonly id='v3-curl' style='min-height:90px;font-size:12px;font-family:SF Mono,monospace;color:var(--green);background:#000'>" +
-      d.curl_command +
+      escapeHtml(d.curl_command) +
       "</textarea>" +
-      "<button onclick='copyV3Curl()' style='margin-top:8px'>" +
+      "<button onclick='copyV3Curl(event)' style='margin-top:8px'>" +
         "<svg viewBox='0 0 24 24' fill='none'><path d='M9 5H7a2 2 0 00-2 2v12a2 2 0 002 2h10a2 2 0 002-2V7a2 2 0 00-2-2h-2M9 5a2 2 0 002 2h2a2 2 0 002-2M9 5a2 2 0 012-2h2a2 2 0 012 2' stroke='currentColor' stroke-width='2' stroke-linecap='round'/></svg>" +
         "📋 复制 curl 命令" +
       "</button>" +
@@ -736,7 +760,7 @@
       "<p class='meta' style='color:var(--text-faint);font-size:12px;margin-top:12px;text-align:center'>⏱ Token 5 分钟内有效</p>";
   }
 
-  async function copyV3Curl() {
+  async function copyV3Curl(event) {
     var t = document.getElementById("v3-curl");
     if (!t) return;
     t.select();
@@ -755,7 +779,7 @@
   async function submitV3() {
     // Step 2: Agent 提交（demo 阶段米娅代跑）
     if (!v3_token) { alert("请先生成 curl 命令"); return; }
-    var platform = document.getElementById("agent-platform").value;
+    var platform = currentV3Platform();
     // 不阻塞弹窗, 默认用平台名 + 4 位随机
     var display_name = "用户-" + Math.random().toString(36).substring(2, 6);
     try {
@@ -780,9 +804,9 @@
         "<p class='meta' style='color:var(--green);font-weight:600'>🔢 步骤 2 / 3</p>" +
         "<p class='meta' style='color:var(--text-faint);margin:8px 0'>智能体已为你生成验证码（真实场景下 Agent 会显示给你, 这里 demo 米娅代跑）</p>" +
         "<label>主人称呼（会显示在档案里）</label>" +
-        "<input id='v3-name' value='" + display_name + "' style='text-align:left;letter-spacing:0;font-family:inherit'>" +
+        "<input id='v3-name' value='" + escapeHtml(display_name) + "' style='text-align:left;letter-spacing:0;font-family:inherit'>" +
         "<label style='margin-top:12px'>6 位验证码（demo 已自动填好, 可改）</label>" +
-        "<input id='v3-code' value='" + v3_verify_code + "' maxlength='6' style='letter-spacing:4px;text-align:center;font-family:SF Mono,monospace;font-size:18px'>" +
+        "<input id='v3-code' value='" + escapeHtml(v3_verify_code) + "' maxlength='6' style='letter-spacing:4px;text-align:center;font-family:SF Mono,monospace;font-size:18px'>" +
         "<label style='margin-top:12px'>主人自述档案（可选, 推荐粘一段）</label>" +
         "<textarea id='v3-bio' placeholder='例: 我是 AI 内容创作者, 做 AI 认知升级课程. 找同频创作者合作.' style='min-height:80px'></textarea>" +
         "<button onclick='verifyV3()' style='margin-top:12px'>" +
@@ -802,7 +826,7 @@
     var code = codeEl ? codeEl.value.trim().toUpperCase() : "";
     var bioEl = document.getElementById("v3-bio");
     var bio = bioEl ? bioEl.value.trim() : "";
-    var platform = document.getElementById("agent-platform").value;
+    var platform = currentV3Platform();
     var display_name = (document.getElementById("v3-name") || {}).value || "匿名用户";
     if (!code) { alert("请先粘 6 位验证码"); return; }
     try {
@@ -844,16 +868,16 @@
       "<div class='consent-card' style='border-color:var(--green);padding:24px;margin-top:16px'>" +
       "<div class='consent-avatar' style='font-size:48px;text-align:center;margin-bottom:12px'>🤖</div>" +
       "<div class='consent-title' style='color:var(--green);font-size:20px;text-align:center;font-weight:700'>✅ 完成</div>" +
-      "<div class='consent-sub' style='text-align:center;color:var(--text-faint);font-size:12px;margin-bottom:20px'>v0.3.2 · 1 步完成 · 中等颗粒度</div>" +
+      "<div class='consent-sub' style='text-align:center;color:var(--text-faint);font-size:12px;margin-bottom:20px'>v0.3.6 · 1 步完成 · 中等颗粒度</div>" +
       "<div class='consent-section'>" +
         "<h4 style='color:var(--green);margin-bottom:8px'>📋 档案摘要</h4>" +
-        "<pre style='white-space:pre-wrap;font-size:13px;color:var(--text);line-height:1.7;font-family:SF Mono,monospace;background:#000;padding:12px;border-radius:4px'>" + d.profile_summary + "</pre>" +
+        "<pre style='white-space:pre-wrap;font-size:13px;color:var(--text);line-height:1.7;font-family:SF Mono,monospace;background:#000;padding:12px;border-radius:4px'>" + escapeHtml(d.profile_summary) + "</pre>" +
       "</div>" +
       "<div class='consent-section' style='margin-top:16px'>" +
-        "<h4 style='color:var(--green);margin-bottom:8px'>🔑 API Key（已存到本地存储）</h4>" +
-        "<div class='consent-row' style='background:#000;padding:8px;border-radius:4px'><span class='v' style='font-family:SF Mono,monospace;font-size:11px;color:var(--green);word-break:break-all'>" + d.api_key + "</span></div>" +
+        "<h4 style='color:var(--green);margin-bottom:8px'>🔑 API Key（仅保存在当前浏览器）</h4>" +
+        "<div class='consent-row' style='background:#000;padding:8px;border-radius:4px'><span class='v' style='font-family:SF Mono,monospace;font-size:11px;color:var(--green);word-break:break-all'>" + escapeHtml(d.api_key) + "</span></div>" +
       "</div>" +
-      "<p class='meta' style='color:var(--green);text-align:center;margin-top:20px'>🔒 已加密存储, 只用于撮合</p>" +
+      "<p class='meta' style='color:var(--green);text-align:center;margin-top:20px'>🔒 本机保存, 只用于撮合</p>" +
       "<div class='consent-actions' style='margin-top:20px;text-align:center'>" +
         "<button class='btn-approve' onclick='afterV3Success()' style='background:var(--green);color:#000;padding:12px 24px;border:none;border-radius:4px;font-weight:600;cursor:pointer;font-size:15px'>进入撮合流程 →</button>" +
       "</div>" +
@@ -874,12 +898,20 @@
     var consentArea = document.getElementById("consent-area");
     consentArea.innerHTML =
       "<div class='consent-card'>" +
-      "<p class='meta' style='color:var(--green);text-align:center'>🎉 已完成, 档案已加密存储</p>" +
+      "<p class='meta' style='color:var(--green);text-align:center'>🎉 已完成, 档案已安全保存</p>" +
       "<p class='meta' style='text-align:center;margin-top:8px'>继续发布找朋友需求, 智能体将基于你的 Agent 活跃度进行撮合</p>" +
       "<div class='consent-actions'>" +
-        "<button class='btn-approve' onclick='approveConsent()'>继续 →</button>" +
+        "<button class='btn-approve' onclick='continueV3Flow()'>继续 →</button>" +
       "</div>" +
       "</div>";
+  }
+
+  function continueV3Flow() {
+    document.getElementById("step-2").classList.remove("active");
+    document.getElementById("step-2").classList.add("done");
+    document.getElementById("step-3").classList.remove("hidden");
+    document.getElementById("step-3").classList.add("active");
+    renderNeedSummary(s_agentBio);
   }
 
   // ==========================================
@@ -945,8 +977,8 @@
       })
     }).then(function(d) {
       s_apiKey = d.api_key;
-      s_agentName = d.agent_name;
-      s_consentId = d.consent_id || d.next_step.match(/consent_[a-z0-9_]+/)[0];
+      s_agentName = (d.profile_summary && d.profile_summary.agent_name) || "Tail.Link Agent";
+      s_consentId = consentIdFromResponse(d);
       localStorage.setItem(K1, s_apiKey);
       localStorage.setItem(K2, s_agentName);
       localStorage.setItem(K3, s_consentId);
@@ -964,30 +996,30 @@
     var p = summary.fields || {};
     var html = "<div class='consent-card'>" +
       "<div class='consent-avatar'>🤖</div>" +
-      "<div class='consent-title'>" + summary.agent_name + "</div>" +
-      "<div class='consent-sub'>" + summary.platform + " · " + (summary.memory_source || "") + "</div>" +
+      "<div class='consent-title'>" + escapeHtml(summary.agent_name) + "</div>" +
+      "<div class='consent-sub'>" + escapeHtml(summary.platform) + " · " + escapeHtml(summary.memory_source || "") + "</div>" +
       "<div class='consent-section'>" +
-        "<h4>主人 " + summary.owner_name + "</h4>" +
-        "<div class='consent-row'><span class='k'>年龄</span><span class='v'>" + (p.age || "-") + "</span></div>" +
-        "<div class='consent-row'><span class='k'>性别</span><span class='v'>" + (p.gender || "-") + "</span></div>" +
-        "<div class='consent-row'><span class='k'>城市</span><span class='v'>" + (p.city || "-") + "</span></div>" +
+        "<h4>主人 " + escapeHtml(summary.owner_name) + "</h4>" +
+        "<div class='consent-row'><span class='k'>年龄</span><span class='v'>" + escapeHtml(p.age || "-") + "</span></div>" +
+        "<div class='consent-row'><span class='k'>性别</span><span class='v'>" + escapeHtml(p.gender || "-") + "</span></div>" +
+        "<div class='consent-row'><span class='k'>城市</span><span class='v'>" + escapeHtml(p.city || "-") + "</span></div>" +
       "</div>" +
       "<div class='consent-section'>" +
         "<h4>性格</h4>" +
-        "<div class='consent-row'><span class='k'>MBTI</span><span class='v'>" + (p.personality && p.personality.mbti || "-") + "</span></div>" +
-        "<div class='consent-row'><span class='k'>兴趣</span><span class='v'>" + ((p.personality && p.personality.interests || []).join("、")) + "</span></div>" +
-        "<div class='consent-row'><span class='k'>价值观</span><span class='v'>" + ((p.personality && p.personality.values || []).join("、")) + "</span></div>" +
+        "<div class='consent-row'><span class='k'>MBTI</span><span class='v'>" + escapeHtml(p.personality && p.personality.mbti || "-") + "</span></div>" +
+        "<div class='consent-row'><span class='k'>兴趣</span><span class='v'>" + escapeHtml((p.personality && p.personality.interests || []).join("、")) + "</span></div>" +
+        "<div class='consent-row'><span class='k'>价值观</span><span class='v'>" + escapeHtml((p.personality && p.personality.values || []).join("、")) + "</span></div>" +
       "</div>" +
       "<div class='consent-section'>" +
         "<h4>工作 · 家境</h4>" +
-        "<div class='consent-row'><span class='k'>工作</span><span class='v'>" + (p.work && (p.work.company || "") + " " + (p.work.role || "")) + "</span></div>" +
-        "<div class='consent-row'><span class='k'>收入档</span><span class='v'>" + (p.work && p.work.income_band || "-") + "</span></div>" +
+        "<div class='consent-row'><span class='k'>工作</span><span class='v'>" + escapeHtml(p.work && (p.work.company || "") + " " + (p.work.role || "")) + "</span></div>" +
+        "<div class='consent-row'><span class='k'>收入档</span><span class='v'>" + escapeHtml(p.work && p.work.income_band || "-") + "</span></div>" +
       "</div>" +
       "<div class='consent-section'>" +
         "<h4>找朋友偏好</h4>" +
-        "<div class='consent-row'><span class='k'>年龄段</span><span class='v'>" + (p.dating_pref && p.dating_pref.age_range ? p.dating_pref.age_range.join(" - ") : "-") + "</span></div>" +
-        "<div class='consent-row'><span class='k'>城市</span><span class='v'>" + (p.dating_pref && (p.dating_pref.city_pref || []).join("、") || "-") + "</span></div>" +
-        "<div class='consent-row'><span class='k'>必须项</span><span class='v'>" + (p.dating_pref && (p.dating_pref.must_have || []).join("、") || "-") + "</span></div>" +
+        "<div class='consent-row'><span class='k'>年龄段</span><span class='v'>" + escapeHtml(p.dating_pref && p.dating_pref.age_range ? p.dating_pref.age_range.join(" - ") : "-") + "</span></div>" +
+        "<div class='consent-row'><span class='k'>城市</span><span class='v'>" + escapeHtml(p.dating_pref && (p.dating_pref.city_pref || []).join("、") || "-") + "</span></div>" +
+        "<div class='consent-row'><span class='k'>必须项</span><span class='v'>" + escapeHtml(p.dating_pref && (p.dating_pref.must_have || []).join("、") || "-") + "</span></div>" +
       "</div>" +
       "<p class='meta' style='color:var(--green);text-align:center;margin-top:16px'>🔒 我们只获取撮合需要的信息, 不会用于其他用途</p>" +
       "<div class='consent-actions'>" +
@@ -1027,9 +1059,9 @@
     var type = "找朋友";
     var html = "<div class='consent-card' style='border-color:var(--border-hi)'>" +
       "<h4 style='color:var(--green);margin-bottom:8px'>📋 智能体已根据你的真实偏好生成找朋友需求</h4>" +
-      "<div class='consent-row'><span class='k'>类型</span><span class='v'>" + type + "</span></div>" +
-      "<div class='consent-row'><span class='k'>描述</span><span class='v'>" + desc + "</span></div>" +
-      "<div class='consent-row'><span class='k'>城市范围</span><span class='v'>" + city + "</span></div>" +
+      "<div class='consent-row'><span class='k'>类型</span><span class='v'>" + escapeHtml(type) + "</span></div>" +
+      "<div class='consent-row'><span class='k'>描述</span><span class='v'>" + escapeHtml(desc) + "</span></div>" +
+      "<div class='consent-row'><span class='k'>城市范围</span><span class='v'>" + escapeHtml(city) + "</span></div>" +
       "<p class='meta' style='margin-top:12px'>主人可点「发布并开始撮合」, 智能体立即开始对接其他 Agent</p>" +
       "</div>";
     document.getElementById("need-summary").innerHTML = html;
@@ -1055,25 +1087,27 @@
   async function loadMatches() {
     try {
       var list = await api("/api/matches");
+      s_matches = list;
       var html = list.length === 0
         ? "<p class='meta'>暂无撮合结果 (需要其他 Agent 也接入 Tail.Link)</p>"
         : "<p class='meta' style='color:var(--green);margin-bottom:12px'>✨ 智能体已为你的主人筛选出 " + list.length + " 个候选朋友</p>" +
-          list.map(function(m) {
+          list.map(function(m, index) {
+            var score = Math.max(0, Math.min(100, Number(m.score) || 0));
             return "<div class='match-card'>" +
               "<div class='match-head'>" +
-                "<div class='match-name'>" + m.target_owner_name + "<span class='badge " + (m.score >= 60 ? "green" : "") + "'>" + m.status + "</span></div>" +
-                "<div class='match-score'>" + m.score.toFixed(0) + "<small>/100</small></div>" +
+                "<div class='match-name'>" + escapeHtml(m.target_owner_name) + "<span class='badge " + (score >= 60 ? "green" : "") + "'>" + escapeHtml(m.status) + "</span></div>" +
+                "<div class='match-score'>" + score.toFixed(0) + "<small>/100</small></div>" +
               "</div>" +
-              "<div class='match-bar'><div class='match-bar-fill' style='width:" + m.score + "%'></div></div>" +
-              "<div class='match-rationale'>" + m.rationale + "</div>" +
-              "<div class='match-detail'><span class='icon'>📈</span>推演: " + (m.predictions || []).slice(0, 2).join(" · ") + "</div>" +
-              "<div class='match-detail'><span class='icon'>⚠️</span>风险: " + (m.risks || []).slice(0, 2).join(" · ") + "</div>" +
+              "<div class='match-bar'><div class='match-bar-fill' style='width:" + score + "%'></div></div>" +
+              "<div class='match-rationale'>" + escapeHtml(m.rationale) + "</div>" +
+              "<div class='match-detail'><span class='icon'>📈</span>推演: " + escapeHtml((m.predictions || []).slice(0, 2).join(" · ")) + "</div>" +
+              "<div class='match-detail'><span class='icon'>⚠️</span>风险: " + escapeHtml((m.risks || []).slice(0, 2).join(" · ")) + "</div>" +
               "<div class='match-tags'>" + Object.keys(m.breakdown || {}).slice(0, 6).map(function(k) {
-                return "<span class='tag'>" + k + " <span class='v'>" + m.breakdown[k] + "</span></span>";
+                return "<span class='tag'>" + escapeHtml(k) + " <span class='v'>" + escapeHtml(m.breakdown[k]) + "</span></span>";
               }).join("") + "</div>" +
               "<div style='display:flex;gap:8px;margin-top:12px;flex-wrap:wrap'>" +
-                "<button onclick='approve(" + m.match_id + ")'><svg viewBox='0 0 24 24' fill='none'><path d='M5 12l5 5 9-9' stroke='currentColor' stroke-width='2.5' stroke-linecap='round' stroke-linejoin='round'/></svg>主人通过</button>" +
-                "<button class='secondary' onclick='generatePoster(" + JSON.stringify(m).replace(/'/g, "&#39;") + ")'><svg viewBox='0 0 24 24' fill='none'><path d='M4 16l4.586-4.586a2 2 0 012.828 0L16 16m-2-2l1.586-1.586a2 2 0 012.828 0L20 16M4 6h16M4 10h16M4 14h8' stroke='currentColor' stroke-width='2' stroke-linecap='round'/></svg>生成海报</button>" +
+                "<button onclick='approve(" + Number(m.match_id) + ")'><svg viewBox='0 0 24 24' fill='none'><path d='M5 12l5 5 9-9' stroke='currentColor' stroke-width='2.5' stroke-linecap='round' stroke-linejoin='round'/></svg>主人通过</button>" +
+                "<button class='secondary' onclick='generatePoster(s_matches[" + index + "])'><svg viewBox='0 0 24 24' fill='none'><path d='M4 16l4.586-4.586a2 2 0 012.828 0L16 16m-2-2l1.586-1.586a2 2 0 012.828 0L20 16M4 6h16M4 10h16M4 14h8' stroke='currentColor' stroke-width='2' stroke-linecap='round'/></svg>生成海报</button>" +
               "</div>" +
             "</div>";
           }).join("");
@@ -1118,8 +1152,8 @@
       platform: p, memory_source: "L1 根铁律", owner_profile: data
     })}).then(function(d) {
       s_apiKey = d.api_key;
-      s_agentName = d.agent_name;
-      s_consentId = d.consent_id || d.next_step.match(/consent_[a-z0-9_]+/)[0];
+      s_agentName = (d.profile_summary && d.profile_summary.agent_name) || "Tail.Link Agent";
+      s_consentId = consentIdFromResponse(d);
       localStorage.setItem(K1, s_apiKey);
       localStorage.setItem(K2, s_agentName);
       localStorage.setItem(K3, s_consentId);
