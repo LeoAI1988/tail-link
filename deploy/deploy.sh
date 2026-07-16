@@ -59,14 +59,19 @@ chown tail-link:tail-link "$STATE_DIR/agent_match.db"
 chmod 0600 "$STATE_DIR/agent_match.db"
 
 if [[ ! -f "$ENV_FILE" ]]; then
-    umask 077
-    cat > "$ENV_FILE" <<EOF
+    # Keep the restrictive umask scoped to the secrets file only. Leaving it
+    # active would make the subsequently-created virtualenv inaccessible to
+    # the unprivileged service account.
+    (
+        umask 077
+        cat > "$ENV_FILE" <<EOF
 TAIL_LINK_ENV=production
 TAIL_LINK_DB_PATH=$STATE_DIR/agent_match.db
 TAIL_LINK_ADMIN_TOKEN=$(openssl rand -hex 32)
 TAIL_LINK_PUBLIC_URL=${DOMAIN:+https://$DOMAIN}
 TAIL_LINK_CONSENT_TTL_MINUTES=60
 EOF
+    )
 else
     chmod 0600 "$ENV_FILE"
     if [[ -n "$DOMAIN" ]]; then
@@ -82,6 +87,10 @@ echo "[4/8] Installing Python dependencies..."
 python3 -m venv "$PROJECT_DIR/backend/venv"
 "$PROJECT_DIR/backend/venv/bin/pip" install --upgrade pip
 "$PROJECT_DIR/backend/venv/bin/pip" install -r "$PROJECT_DIR/backend/requirements.txt"
+# Repair permissions from older deployments that created the virtualenv while
+# umask 077 was active. The application code contains no secrets; runtime
+# secrets remain protected in $ENV_FILE and $STATE_DIR.
+chmod -R a+rX "$PROJECT_DIR/backend/venv"
 
 echo "[5/8] Configuring systemd..."
 cat > /etc/systemd/system/tail-link.service <<EOF
