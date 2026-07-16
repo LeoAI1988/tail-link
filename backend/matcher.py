@@ -205,7 +205,8 @@ def score_resource(need: Need, owner_a: Owner, target: Owner) -> Dict[str, Any]:
         "规模匹配": round(score_budget * 100, 1),
     }
     weighted = sum(breakdown[k] / 100 * w for k, w in weights.items())
-    total = round(weighted, 1)
+    # breakdown 是 0-100 分，权重和为 1；最终结果也应保持 0-100。
+    total = round(weighted * 100, 1)
 
     rationale = (
         f"供给能力 {int(score_offer*100)}%, "

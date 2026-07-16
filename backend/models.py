@@ -6,13 +6,18 @@
   - Need: 主人发布的需求 (找对象 / 找资源 / 找项目)
   - Match: 撮合结果
 """
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Optional, List
 from enum import Enum
 from sqlmodel import Field, SQLModel, Relationship
 from sqlalchemy import Column, JSON as SA_JSON
 from sqlalchemy.types import TypeDecorator, String
 import json
+
+
+def utcnow() -> datetime:
+    """Return naive UTC for backward-compatible SQLite storage."""
+    return datetime.now(timezone.utc).replace(tzinfo=None)
 
 
 # JSON 字段类型 (跨数据库兼容, SQLite 用 TEXT 存 JSON 字符串)
@@ -52,7 +57,10 @@ class Agent(SQLModel, table=True):
     owner_name: str                                       # 主人真名/代号
     api_key: str = Field(unique=True, index=True)         # Agent 调 API 用
     platform: str                                          # Agent 平台
-    created_at: datetime = Field(default_factory=datetime.utcnow)
+    is_active: bool = Field(default=True, index=True)      # 老注册流程直接激活, 自动接入需主人同意
+    consent_token_hash: Optional[str] = None               # 只存授权 token 摘要
+    consent_expires_at: Optional[datetime] = None
+    created_at: datetime = Field(default_factory=utcnow)
 
     # 关联
     owner: Optional["Owner"] = Relationship(back_populates="agent",
@@ -73,13 +81,13 @@ class Owner(SQLModel, table=True):
     height_cm: Optional[int] = None
 
     # JSON 字段 (work / family / personality / resources / dating_pref)
-    work: dict = Field(default={}, sa_column=Column(JSONField))
-    family: dict = Field(default={}, sa_column=Column(JSONField))
-    personality: dict = Field(default={}, sa_column=Column(JSONField))
-    resources: dict = Field(default={}, sa_column=Column(JSONField))
-    dating_pref: dict = Field(default={}, sa_column=Column(JSONField))
+    work: dict = Field(default_factory=dict, sa_column=Column(JSONField))
+    family: dict = Field(default_factory=dict, sa_column=Column(JSONField))
+    personality: dict = Field(default_factory=dict, sa_column=Column(JSONField))
+    resources: dict = Field(default_factory=dict, sa_column=Column(JSONField))
+    dating_pref: dict = Field(default_factory=dict, sa_column=Column(JSONField))
 
-    updated_at: datetime = Field(default_factory=datetime.utcnow)
+    updated_at: datetime = Field(default_factory=utcnow)
 
     agent: Optional[Agent] = Relationship(back_populates="owner")
 
@@ -94,11 +102,11 @@ class Need(SQLModel, table=True):
     description: str                                      # 详细描述
 
     # 结构化需求 (dict)
-    spec: dict = Field(default={}, sa_column=Column(JSONField))
+    spec: dict = Field(default_factory=dict, sa_column=Column(JSONField))
 
     # 状态
     status: str = Field(default="open")
-    created_at: datetime = Field(default_factory=datetime.utcnow)
+    created_at: datetime = Field(default_factory=utcnow)
     closed_at: Optional[datetime] = None
 
     agent: Optional[Agent] = Relationship(back_populates="needs")
@@ -114,12 +122,12 @@ class Match(SQLModel, table=True):
 
     # 匹配评分 (0-100)
     score_overall: float
-    score_breakdown: dict = Field(default={}, sa_column=Column(JSONField))
+    score_breakdown: dict = Field(default_factory=dict, sa_column=Column(JSONField))
 
     # Agent 推演
-    analysis: dict = Field(default={}, sa_column=Column(JSONField))
+    analysis: dict = Field(default_factory=dict, sa_column=Column(JSONField))
 
     # 状态
     status: str = Field(default="proposed")
-    proposed_at: datetime = Field(default_factory=datetime.utcnow)
+    proposed_at: datetime = Field(default_factory=utcnow)
     expires_at: Optional[datetime] = None

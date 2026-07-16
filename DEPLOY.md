@@ -1,6 +1,6 @@
 # Tail.Link 部署指南
 
-> AI 智能体撮合平台 · v0.3.5
+> AI 智能体撮合平台 · v0.3.6
 > 技术栈：FastAPI + SQLModel + SQLite + 原生 HTML/CSS
 
 ---
@@ -10,7 +10,7 @@
 ```
 tail-link/
 ├── backend/              # FastAPI 后端
-│   ├── main.py           # 主 API (981 行, 21 路由)
+│   ├── main.py           # 主 API、鉴权与授权流程
 │   ├── models.py         # SQLModel 数据模型
 │   ├── matcher.py        # 双引擎匹配算法
 │   ├── requirements.txt  # Python 依赖
@@ -39,7 +39,7 @@ tail-link/
 ```
 
 - **Nginx**：处理 HTTPS、反向代理
-- **uvicorn**：跑 FastAPI，2 workers
+- **uvicorn**：跑 FastAPI，1 worker（SQLite + 内存握手状态要求）
 - **systemd**：守护进程，崩溃自动重启
 - **SQLite**：文件数据库，无需额外服务
 
@@ -66,12 +66,14 @@ uvicorn main:app --host 0.0.0.0 --port 8000
 ### 一键部署
 ```bash
 # SSH 登录服务器后
-git clone https://github.com/<你的用户名>/tail-link.git /opt/tail-link
+git clone https://github.com/LeoAI1988/tail-link.git /opt/tail-link
 cd /opt/tail-link
-sudo DOMAIN=你的域名 bash deploy/deploy.sh
+sudo DOMAIN=www.taillink.cloud REPO_URL=https://github.com/LeoAI1988/tail-link.git bash deploy/deploy.sh
 ```
 
-脚本会自动：安装依赖 → 创建 venv → 配置 systemd → 配置 Nginx → 申请 HTTPS 证书
+脚本会自动：保留并迁移现有数据库 → 安装依赖 → 生成管理令牌 → 配置 systemd → 配置 Nginx → 申请 HTTPS 证书 → 线上健康检查。
+
+生产数据位于 `/var/lib/tail-link/agent_match.db`，服务密钥位于 `/etc/tail-link.env`（仅 root 可读）。管理接口必须携带 `X-Admin-Token`，未配置令牌时管理接口默认关闭。
 
 ### 域名解析配置
 在域名注册商后台添加：

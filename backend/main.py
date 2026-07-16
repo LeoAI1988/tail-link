@@ -1,27 +1,57 @@
 """
 Agent Match Platform - 主 API
 """
+import hashlib
+import os
 import secrets
 from datetime import datetime, timedelta
+from pathlib import Path
 from typing import List, Optional
-from fastapi import FastAPI, HTTPException, Depends, Header
+from fastapi import FastAPI, HTTPException, Depends, Header, Request
 from fastapi.staticfiles import StaticFiles
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse
 from sqlmodel import SQLModel, Session, create_engine, select
-from pydantic import BaseModel
+from pydantic import BaseModel, Field as PydanticField
 from contextlib import asynccontextmanager
+from sqlalchemy import inspect, text
 
-from models import Agent, Owner, Need, Match, NeedType
+from models import Agent, Owner, Need, Match, NeedType, utcnow
 import matcher
 
 
-# ===== DB =====
-sqlite_file = "agent_match.db"
-engine = create_engine(f"sqlite:///{sqlite_file}", echo=False)
+# ===== 配置 / DB =====
+APP_VERSION = "0.3.6"
+ADMIN_TOKEN = os.getenv("TAIL_LINK_ADMIN_TOKEN", "")
+PUBLIC_URL = os.getenv("TAIL_LINK_PUBLIC_URL", "").rstrip("/")
+CONSENT_TTL_MINUTES = int(os.getenv("TAIL_LINK_CONSENT_TTL_MINUTES", "60"))
+
+_db_value = os.getenv("TAIL_LINK_DB_PATH", "agent_match.db")
+sqlite_path = Path(_db_value).expanduser()
+if not sqlite_path.is_absolute():
+    sqlite_path = (Path(__file__).resolve().parent / sqlite_path).resolve()
+sqlite_path.parent.mkdir(parents=True, exist_ok=True)
+engine = create_engine(
+    f"sqlite:///{sqlite_path.as_posix()}",
+    echo=False,
+    connect_args={"check_same_thread": False, "timeout": 30},
+)
 
 
 def create_db():
     SQLModel.metadata.create_all(engine)
+    # create_all 不会给现有 SQLite 表补列, 这里做向后兼容的小迁移。
+    migrations = {
+        "is_active": "ALTER TABLE agent ADD COLUMN is_active BOOLEAN NOT NULL DEFAULT 1",
+        "consent_token_hash": "ALTER TABLE agent ADD COLUMN consent_token_hash VARCHAR",
+        "consent_expires_at": "ALTER TABLE agent ADD COLUMN consent_expires_at DATETIME",
+    }
+    with engine.begin() as conn:
+        columns = {col["name"] for col in inspect(conn).get_columns("agent")}
+        for column, statement in migrations.items():
+            if column not in columns:
+                conn.execute(text(statement))
+        conn.execute(text("PRAGMA journal_mode=WAL"))
+        conn.execute(text("PRAGMA busy_timeout=30000"))
 
 
 def get_session():
@@ -38,15 +68,23 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="Tail.Link",
     description="AI Agent 之间的撮合平台 - 替主人找朋友",
-    version="0.3.5",
+    version=APP_VERSION,
     lifespan=lifespan,
 )
 
-# 静态前端
-import os
 STATIC_DIR = os.path.join(os.path.dirname(__file__), "..", "frontend")
 if os.path.isdir(STATIC_DIR):
     app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
+
+
+@app.middleware("http")
+async def security_headers(request: Request, call_next):
+    response = await call_next(request)
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    response.headers["X-Frame-Options"] = "DENY"
+    response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
+    response.headers["Permissions-Policy"] = "camera=(), microphone=(), geolocation=()"
+    return response
 
 
 # ===== 鉴权 =====
@@ -57,15 +95,51 @@ def get_agent_from_key(x_api_key: str = Header(..., alias="X-API-Key"),
     agent = session.exec(select(Agent).where(Agent.api_key == x_api_key)).first()
     if not agent:
         raise HTTPException(status_code=401, detail="Invalid API key")
+    if not agent.is_active:
+        raise HTTPException(status_code=403, detail="Owner consent required")
     return agent
+
+
+def require_admin(x_admin_token: Optional[str] = Header(None, alias="X-Admin-Token")):
+    """生产管理接口必须显式配置并携带管理员令牌。"""
+    if not ADMIN_TOKEN:
+        raise HTTPException(status_code=503, detail="Admin API is disabled")
+    if not x_admin_token or not secrets.compare_digest(x_admin_token, ADMIN_TOKEN):
+        raise HTTPException(status_code=401, detail="Invalid admin token")
+
+
+def _hash_token(token: str) -> str:
+    return hashlib.sha256(token.encode("utf-8")).hexdigest()
+
+
+def _pending_consent(consent_id: str, session: Session):
+    try:
+        prefix, owner_id_text, raw_token = consent_id.split("_", 2)
+        if prefix != "consent":
+            raise ValueError
+        owner_id = int(owner_id_text)
+    except (ValueError, AttributeError):
+        raise HTTPException(400, "invalid consent_id")
+
+    owner = session.get(Owner, owner_id)
+    if not owner:
+        raise HTTPException(404, "owner not found")
+    agent = session.get(Agent, owner.agent_id)
+    if not agent or not agent.consent_token_hash:
+        raise HTTPException(410, "consent link is no longer valid")
+    if not secrets.compare_digest(_hash_token(raw_token), agent.consent_token_hash):
+        raise HTTPException(404, "consent link not found")
+    if not agent.consent_expires_at or utcnow() > agent.consent_expires_at:
+        raise HTTPException(410, "consent link expired")
+    return owner, agent
 
 
 # ===== Pydantic Schemas =====
 
 class RegisterRequest(BaseModel):
-    name: str
-    owner_name: str
-    platform: str = "generic"
+    name: str = PydanticField(min_length=1, max_length=80)
+    owner_name: str = PydanticField(min_length=1, max_length=80)
+    platform: str = PydanticField(default="generic", min_length=1, max_length=40)
 
 
 class RegisterResponse(BaseModel):
@@ -83,18 +157,18 @@ class OwnerUpsertRequest(BaseModel):
     gender: Optional[str] = None
     city: Optional[str] = None
     height_cm: Optional[int] = None
-    work: dict = {}
-    family: dict = {}
-    personality: dict = {}
-    resources: dict = {}
-    dating_pref: dict = {}
+    work: dict = PydanticField(default_factory=dict)
+    family: dict = PydanticField(default_factory=dict)
+    personality: dict = PydanticField(default_factory=dict)
+    resources: dict = PydanticField(default_factory=dict)
+    dating_pref: dict = PydanticField(default_factory=dict)
 
 
 class NeedCreateRequest(BaseModel):
     need_type: str  # dating/resource/project/talent
-    title: str
-    description: str
-    spec: dict = {}
+    title: str = PydanticField(min_length=1, max_length=160)
+    description: str = PydanticField(min_length=1, max_length=4000)
+    spec: dict = PydanticField(default_factory=dict)
 
 
 # ===== Agent 自动接入协议 =====
@@ -110,10 +184,10 @@ class AgentProtocolField(BaseModel):
 
 class AutoEnrollRequest(BaseModel):
     """Agent 自动接入请求 - 主人零参与"""
-    agent_name: str
-    owner_name: str
-    platform: str  # hermes | claude_code | codex | cursor | generic
-    memory_source: Optional[str] = None  # 记忆来源描述: L1/MEMORY.md/.claude/memory/...
+    agent_name: str = PydanticField(min_length=1, max_length=80)
+    owner_name: str = PydanticField(min_length=1, max_length=80)
+    platform: str = PydanticField(min_length=1, max_length=40)  # hermes | claude_code | codex | openclaw | generic
+    memory_source: Optional[str] = PydanticField(default=None, max_length=500)
     owner_profile: dict  # Agent 自动从自己记忆里读出的主人档案
     consent_token: Optional[str] = None  # 主人给的同意 token (可空, 主人可在前端追加确认)
 
@@ -122,6 +196,7 @@ class AutoEnrollResponse(BaseModel):
     agent_id: int
     api_key: str
     owner_id: int
+    consent_id: str
     profile_summary: dict  # 主人看到的摘要
     consent_required: bool  # 是否需要主人前端确认
     next_step: str  # 给 Agent 的下一步指令
@@ -152,8 +227,9 @@ def root():
 
 
 @app.get("/health")
-def health():
-    return {"status": "ok", "ts": datetime.utcnow().isoformat()}
+def health(session: Session = Depends(get_session)):
+    session.exec(text("SELECT 1"))
+    return {"status": "ok", "version": APP_VERSION, "db": "ok", "ts": utcnow().isoformat() + "Z"}
 
 
 @app.get("/rules")
@@ -161,7 +237,7 @@ def rules():
     """返回运行规则 - 任何 Agent 调一次就能掌握全平台协议"""
     return {
         "platform": "Tail.Link",
-        "version": "0.3.5",
+        "version": APP_VERSION,
         "purpose": "替主人找朋友",
         "flow": [
             "1. POST /api/register 注册 Agent, 拿到 api_key",
@@ -218,7 +294,7 @@ def agent_protocol():
     """
     return {
         "platform": "Tail.Link",
-        "version": "0.3.5",
+        "version": APP_VERSION,
         "tagline": "让 AI 智能体替你去找朋友",
         "philosophy": (
             "人类自己都不一定了解自己。"
@@ -370,6 +446,7 @@ def auto_enroll(req: AutoEnrollRequest, session: Session = Depends(get_session))
         owner_name=req.owner_name,
         platform=req.platform,
         api_key=api_key,
+        is_active=False,
     )
     session.add(agent)
     session.commit()
@@ -384,18 +461,24 @@ def auto_enroll(req: AutoEnrollRequest, session: Session = Depends(get_session))
     for d in ["work", "family", "personality", "resources", "dating_pref"]:
         if d in profile and profile[d]:
             setattr(owner, d, profile[d])
-    owner.updated_at = datetime.utcnow()
+    owner.updated_at = utcnow()
     session.add(owner)
     session.commit()
     session.refresh(owner)
 
-    # 生成 consent_id (简化版: 直接用 owner_id 作为确认号)
-    consent_id = f"consent_{owner.id}_{secrets.token_urlsafe(8)}"
+    # 生成一次性授权链接；数据库只保存 token 摘要，避免明文泄露。
+    consent_token = secrets.token_urlsafe(24)
+    consent_id = f"consent_{owner.id}_{consent_token}"
+    agent.consent_token_hash = _hash_token(consent_token)
+    agent.consent_expires_at = utcnow() + timedelta(minutes=CONSENT_TTL_MINUTES)
+    session.add(agent)
+    session.commit()
 
     return AutoEnrollResponse(
         agent_id=agent.id,
         api_key=api_key,
         owner_id=owner.id,
+        consent_id=consent_id,
         profile_summary={
             "agent_name": agent.name,
             "owner_name": agent.owner_name,
@@ -411,19 +494,7 @@ def auto_enroll(req: AutoEnrollRequest, session: Session = Depends(get_session))
 @app.get("/consent/{consent_id}")
 def get_consent(consent_id: str, session: Session = Depends(get_session)):
     """主人读取待确认的档案摘要"""
-    if not consent_id.startswith("consent_"):
-        raise HTTPException(400, "invalid consent_id")
-    parts = consent_id.split("_")
-    if len(parts) < 3:
-        raise HTTPException(400, "invalid consent_id format")
-    try:
-        owner_id = int(parts[1])
-    except ValueError:
-        raise HTTPException(400, "invalid owner_id in consent_id")
-    owner = session.get(Owner, owner_id)
-    if not owner:
-        raise HTTPException(404, "owner not found")
-    agent = session.get(Agent, owner.agent_id)
+    owner, agent = _pending_consent(consent_id, session)
     return {
         "consent_id": consent_id,
         "agent_name": agent.name,
@@ -444,19 +515,12 @@ def get_consent(consent_id: str, session: Session = Depends(get_session)):
 @app.post("/consent/{consent_id}/approve")
 def approve_consent(consent_id: str, session: Session = Depends(get_session)):
     """主人同意授权"""
-    if not consent_id.startswith("consent_"):
-        raise HTTPException(400, "invalid consent_id")
-    parts = consent_id.split("_")
-    if len(parts) < 3:
-        raise HTTPException(400, "invalid consent_id format")
-    try:
-        owner_id = int(parts[1])
-    except ValueError:
-        raise HTTPException(400, "invalid owner_id in consent_id")
-    owner = session.get(Owner, owner_id)
-    if not owner:
-        raise HTTPException(404, "owner not found")
-    owner.updated_at = datetime.utcnow()
+    owner, agent = _pending_consent(consent_id, session)
+    agent.is_active = True
+    agent.consent_token_hash = None
+    agent.consent_expires_at = None
+    owner.updated_at = utcnow()
+    session.add(agent)
     session.add(owner)
     session.commit()
     return {"ok": True, "consent_id": consent_id, "status": "approved",
@@ -466,24 +530,10 @@ def approve_consent(consent_id: str, session: Session = Depends(get_session)):
 @app.post("/consent/{consent_id}/reject")
 def reject_consent(consent_id: str, session: Session = Depends(get_session)):
     """主人拒绝授权 - 删除 Agent 和档案"""
-    if not consent_id.startswith("consent_"):
-        raise HTTPException(400, "invalid consent_id")
-    parts = consent_id.split("_")
-    if len(parts) < 3:
-        raise HTTPException(400, "invalid consent_id format")
-    try:
-        owner_id = int(parts[1])
-    except ValueError:
-        raise HTTPException(400, "invalid owner_id in consent_id")
-    owner = session.get(Owner, owner_id)
-    if not owner:
-        raise HTTPException(404, "owner not found")
-    agent_id = owner.agent_id
-    # 删除 owner 和 agent
-    agent = session.get(Agent, agent_id)
+    owner, agent = _pending_consent(consent_id, session)
+    # 待授权 Agent 不能创建需求，因此可以安全删除这两条记录。
     session.delete(owner)
-    if agent:
-        session.delete(agent)
+    session.delete(agent)
     session.commit()
     return {"ok": True, "consent_id": consent_id, "status": "rejected",
             "message": "主人已拒绝, Agent 和档案已删除"}
@@ -514,9 +564,9 @@ def upsert_owner(req: OwnerUpsertRequest,
         owner = Owner(agent_id=agent.id)
         session.add(owner)
 
-    for k, v in req.dict(exclude_unset=True).items():
+    for k, v in req.model_dump(exclude_unset=True).items():
         setattr(owner, k, v)
-    owner.updated_at = datetime.utcnow()
+    owner.updated_at = utcnow()
     session.commit()
     session.refresh(owner)
 
@@ -596,6 +646,13 @@ def trigger_match_for_need(need: Need, session: Session):
         need, owner_a, all_owners, all_needs, top_k=5
     )
 
+    # 重撮合只替换尚未审批的旧结果，避免重复卡片不断累积。
+    old_matches = session.exec(
+        select(Match).where(Match.need_a_id == need.id, Match.status == "proposed")
+    ).all()
+    for old_match in old_matches:
+        session.delete(old_match)
+
     for c in candidates:
         # 查对方有没有对应反向需求 (DATING 场景不必, RESOURCE 场景需要)
         reverse_need = None
@@ -631,7 +688,7 @@ def trigger_match_for_need(need: Need, session: Session):
             score_breakdown=c["breakdown"],
             analysis=analysis_payload,
             status="proposed",
-            expires_at=datetime.utcnow() + timedelta(days=30),
+            expires_at=utcnow() + timedelta(days=30),
         )
         session.add(match)
     session.commit()
@@ -700,7 +757,8 @@ def approve_match(match_id: int,
 # ===== 全网撮合 (管理员/全量) =====
 
 @app.post("/api/admin/rematch-all")
-def rematch_all(session: Session = Depends(get_session)):
+def rematch_all(_: None = Depends(require_admin),
+                session: Session = Depends(get_session)):
     """全网所有 open 需求重新撮合"""
     needs = session.exec(select(Need).where(Need.status == "open")).all()
     for n in needs:
@@ -714,7 +772,8 @@ def rematch_all(session: Session = Depends(get_session)):
 
 
 @app.post("/api/admin/reset-db")
-def reset_db(session: Session = Depends(get_session)):
+def reset_db(_: None = Depends(require_admin),
+             session: Session = Depends(get_session)):
     """清空所有数据 (MVP 阶段)"""
     from sqlalchemy import text
     for table in ["match", "need", "owner", "agent"]:
@@ -743,10 +802,10 @@ class HandshakeStartV3Response(BaseModel):
 
 
 class AgentSubmitV3Request(BaseModel):
-    agent_platform: str
-    mtime_stats: dict = {}
-    owner_paste: Optional[str] = ""
-    display_name: Optional[str] = "匿名用户"
+    agent_platform: str = PydanticField(min_length=1, max_length=40)
+    mtime_stats: dict = PydanticField(default_factory=dict)
+    owner_paste: Optional[str] = PydanticField(default="", max_length=20000)
+    display_name: Optional[str] = PydanticField(default="匿名用户", max_length=80)
 
 
 class AgentSubmitV3Response(BaseModel):
@@ -756,10 +815,10 @@ class AgentSubmitV3Response(BaseModel):
 
 
 class HandshakeVerifyV3Request(BaseModel):
-    verify_code: str
+    verify_code: str = PydanticField(min_length=6, max_length=6)
     owner_consent: bool
-    display_name: Optional[str] = "匿名用户"
-    platform: Optional[str] = "unknown"
+    display_name: Optional[str] = PydanticField(default="匿名用户", max_length=80)
+    platform: Optional[str] = PydanticField(default="unknown", max_length=40)
 
 
 class HandshakeVerifyV3Response(BaseModel):
@@ -773,14 +832,21 @@ class HandshakeVerifyV3Response(BaseModel):
 
 
 class HandshakeStartV3Request(BaseModel):
-    agent_platform: str = "claude-code"
+    agent_platform: str = PydanticField(default="claude-code", min_length=1, max_length=40)
 
 
 @app.post("/api/handshake/start", response_model=HandshakeStartV3Response)
-async def handshake_v3_start(req: HandshakeStartV3Request = HandshakeStartV3Request()):
+async def handshake_v3_start(req: HandshakeStartV3Request, request: Request):
     """v0.3.1 握手步骤 1: 生成 token + curl 命令 (平台相关)"""
+    now = utcnow()
+    # 清理已过期握手，避免长期运行后内存持续增长。
+    expired = [key for key, value in HANDSHAKES_V3.items()
+               if value["expires_at"] < now]
+    for key in expired:
+        HANDSHAKES_V3.pop(key, None)
+
     token = secrets.token_urlsafe(8)
-    endpoint = "https://6f4b786f87ea0395-175-178-86-107.serveousercontent.com"
+    endpoint = PUBLIC_URL or str(request.base_url).rstrip("/")
     platform = req.agent_platform
     # 6/20 修复 BUG: curl 模板硬编码 claude-code → 改成动态 platform + 提示智能体读主人记忆
     curl_cmd = (
@@ -799,8 +865,8 @@ async def handshake_v3_start(req: HandshakeStartV3Request = HandshakeStartV3Requ
         "profile_text": None,
         "display_name": None,
         "platform": platform,
-        "created_at": datetime.now(),
-        "expires_at": datetime.now() + timedelta(minutes=5),
+        "created_at": now,
+        "expires_at": now + timedelta(minutes=5),
         "owner_consent": None,
     }
     return HandshakeStartV3Response(token=token, curl_command=curl_cmd, endpoint=endpoint, expires_in=300)
@@ -812,7 +878,8 @@ async def handshake_v3_submit(token: str, req: AgentSubmitV3Request):
     if token not in HANDSHAKES_V3:
         raise HTTPException(status_code=404, detail="Invalid or expired token")
     hs = HANDSHAKES_V3[token]
-    if datetime.now() > hs["expires_at"]:
+    if utcnow() > hs["expires_at"]:
+        HANDSHAKES_V3.pop(token, None)
         raise HTTPException(status_code=410, detail="Token expired")
     verify_code = "".join([secrets.choice("0123456789ABCDEFGHJKLMNPQRSTUVWXYZ") for _ in range(6)])
     hs["verify_code"] = verify_code
@@ -829,9 +896,12 @@ async def handshake_v3_verify(token: str, req: HandshakeVerifyV3Request):
     if token not in HANDSHAKES_V3:
         raise HTTPException(status_code=404, detail="Invalid or expired token")
     hs = HANDSHAKES_V3[token]
+    if utcnow() > hs["expires_at"]:
+        HANDSHAKES_V3.pop(token, None)
+        raise HTTPException(status_code=410, detail="Token expired")
     if not hs["verify_code"]:
         raise HTTPException(status_code=400, detail="Agent hasn't submitted yet")
-    if req.verify_code.upper() != hs["verify_code"]:
+    if not secrets.compare_digest(req.verify_code.upper(), hs["verify_code"]):
         raise HTTPException(status_code=401, detail="Wrong verify code")
     if not req.owner_consent:
         return HandshakeVerifyV3Response(success=False, message="主人拒绝同步,握手终止")
@@ -873,7 +943,7 @@ async def handshake_v3_verify(token: str, req: HandshakeVerifyV3Request):
             p = dict(owner.personality or {})
             p["bio"] = hs["profile_text"]
             owner.personality = p
-        owner.updated_at = datetime.now()
+        owner.updated_at = utcnow()
         session.commit()
     # 生成 profile_summary (翔哥档案展示用)
     stats = hs.get("mtime_stats") or {}
@@ -899,7 +969,7 @@ async def handshake_v3_verify(token: str, req: HandshakeVerifyV3Request):
     # v0.3.5 新增: 200 字小传 + 找朋友描述 + 城市 (基于真实数据, 不是模板填充)
     agent_bio = generate_bio(req.display_name or "匿名用户", stats, hs.get("profile_text") or "", hs.get("platform") or req.platform or "unknown")
 
-    return HandshakeVerifyV3Response(
+    response = HandshakeVerifyV3Response(
         success=True,
         api_key=api_key,
         agent_id=str(agent_id),
@@ -907,6 +977,8 @@ async def handshake_v3_verify(token: str, req: HandshakeVerifyV3Request):
         agent_bio=agent_bio,
         message=f"✅ 握手完成! API Key: {api_key[:20]}...",
     )
+    HANDSHAKES_V3.pop(token, None)
+    return response
 
 
 def generate_bio(name: str, stats: dict, profile_text: str, platform: str = "unknown") -> dict:
