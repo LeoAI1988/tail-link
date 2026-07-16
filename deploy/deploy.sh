@@ -169,7 +169,12 @@ fi
 
 echo "================================================"
 echo "  Deployment complete"
-echo "  URL: ${DOMAIN:+https://$DOMAIN}${DOMAIN:-http://SERVER_IP}"
+if [[ -n "$DOMAIN" ]]; then
+    DEPLOY_URL="https://$DOMAIN"
+else
+    DEPLOY_URL="http://SERVER_IP"
+fi
+echo "  URL: $DEPLOY_URL"
 echo "  Admin token: stored only in $ENV_FILE"
 echo "  Note: Tencent Cloud firewall must allow TCP 80 and 443."
 echo "================================================"
